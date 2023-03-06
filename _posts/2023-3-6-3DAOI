@@ -1,0 +1,230 @@
+# 3D AOI
+
+# 选型
+
+投影仪：德州仪器dlp  4500， 工业投影仪
+
+远心镜头：自己做，带同轴光，双远心畸变小，
+
+# 投影仪标定
+
+# 相机标定
+
+张氏标定法，老样子
+
+# 三维重构
+
+三频移项四步相移
+
+[https://zhuanlan.zhihu.com/p/31136024](https://zhuanlan.zhihu.com/p/31136024)
+
+[求相位](https://www.zhihu.com/question/307328720/answer/2556668894)
+
+# 缺陷检测算法
+
+模板匹配，深度图，OCR
+
+---
+
+重建算法：
+```python
+import numpy as np
+import time
+import cv2
+import open3d
+import glob
+
+def getpointclouds(num):
+    # use structured images to construct depth mamp
+    # load camera parameters
+    data_file = cv2.FileStorage("D:/Python/PycharmProjects/structured_light3/parameters" + str(num + 1) + ".xml", cv2.FileStorage_READ)
+    cmu = data_file.getNode("cm").mat()
+    rtc = data_file.getNode('rtc').mat()
+    data_file.release()
+
+    # load projector parameters
+    data_file = cv2.FileStorage("D:/Python/PycharmProjects/structured_light3/parameters" + str(num + 1) + ".xml",
+                                cv2.FileStorage_READ)
+    pintrinsic = data_file.getNode("pm").mat()
+    rtp = data_file.getNode("rtp").mat()
+    h = (cmu, pintrinsic)
+    rt = (rtc, rtp)
+    fs = [40, 39, 10]
+    print(h, rt)
+
+    # load structured images
+    imges = read_imgs("D:/newdata/test_board/*.jpg", 4)  # 灰度图缩小4倍
+    imges = imges[12 * num:12 * (num + 1)] # [12, h, w]
+    imgrgb = read_imgsrgb("D:/newdata/test_board/*.jpg", 4) # 彩色图缩小4倍
+    imgrgb = imgrgb[12 * num:12 * (num + 1)] # [12, h, w, c]
+    n, cols, rows, chanels = imgrgb.shape
+    rgb = np.sum(imgrgb, 0) / n # 彩色取所有rgb和均值
+
+    # caculate phasemap
+    phase3, mask3 = phase_shift_caculate(imges[0:4], 200, 15, 0.2)
+    phase2, mask2 = phase_shift_caculate(imges[4:8], 200, 15, 0.2)
+    phase1, mask1 = phase_shift_caculate(imges[8:12], 200, 15, 0.2)  # 0.4 for 2560 0.3 for 1280
+    phase, maskp = unwrape_new1(phase1, phase2, phase3, fs)
+
+    mask = mask1 + mask2 + mask3
+
+    # caculate depthmap
+    depthmap = reconstruction3D(phase, h, rt)
+    np.savez("D:/newdata/" + "pcb1280test0" + str(num) + ".npz", depthmap, mask, rgb / 255)
+
+    # 以下全为测试：
+    depthmapz = np.ma.masked_array(depthmap[:, :, 2], mask1)
+    mask2 = (depthmapz < -2) + (depthmapz > 1) + mask1
+    depthmapz = np.ma.masked_array(depthmapz, mask2)
+    depthmapcloudt = []
+
+    depthmapcloud = depthmap.reshape((-1, 3))
+    depthmapmat = np.zeros((rows, cols)).reshape((-1))
+    mask1 = mask1.reshape((-1, 1))
+    maskp = maskp.reshape((-1, 1))
+    n, d = depthmapcloud.shape
+    rgbmap = rgb.reshape(-1, 3)
+    for i in range(n):
+        pointwithcolor = np.zeros(6)
+        if (depthmapcloud[i, 2] < 1 and depthmapcloud[i, 2] > -1.9 and mask1[i] == False):
+            depthmapmat[i] = (3 - depthmapcloud[i, 2])
+            pointwithcolor[0:3] = depthmapcloud[i]
+            pointwithcolor[3:6] = rgbmap[i] / 255
+            depthmapcloudt.append(pointwithcolor)
+        else:
+            depthmapmat[i] = 0
+
+    depthmapmatout = depthmapmat.reshape((rows, cols))
+    depthmapcloudt = np.array(depthmapcloudt)
+    np.savetxt("D:/newdata/" + "pcb512.xyzrgb", depthmapcloudt, delimiter=" ", fmt="%f")
+    time.sleep(10)
+    point_cloud = open3d.io.read_point_cloud("D:/newdata/" + "pcb512.xyzrgb")
+    open3d.visualization.draw_geometries([point_cloud])
+
+if __name__ == "__main__":
+    for i in range(4):
+        getpointclouds(i)
+
+# -------------------------------------
+# 辅助函数
+def read_imgs(filelist, binum):
+    filelist = sorted(glob.glob(filelist))
+    src = cv2.imread(filelist[0], 0)
+    h, w = src.shape
+    h, w = h // binum, w // binum
+    imgs = np.zeros((len(filelist), h, w), dtype=np.uint8)
+    num = 0
+    for i in filelist:
+        src = cv2.imread(i, 0)
+        src = cv2.resize(src, (w, h))
+        imgs[num, :, :] = src
+        num += 1
+    return imgs
+
+def read_imgsrgb(directory, binum):
+    filelist = sorted(glob.glob(directory))
+    src = cv2.imread(filelist[0])
+    h, w, c = src.shape
+    h, w = h // binum, w // binum
+    imgs = np.zeros((len(filelist), h, w, c), dtype=np.uint8)
+    num = 0
+    for i in filelist:
+        src = cv2.imread(i)
+        src = cv2.cvtColor(src, cv2.COLOR_BGR2RGB)
+        src = cv2.resize(src, (w, h))
+        imgs[num, :, :, :] = src
+        num += 1
+    return imgs
+
+def phase_shift_caculate(data, th=200, tl=20, mp=0.15):
+    src = data[0]
+    data = data.astype(np.float64)
+    n, h, w = data.shape
+    data = data.transpose(1, 2, 0) # [4, h, w] 转为 [w, h, 4]
+    z = np.arange(n) # [1, 2, 3, 4]
+    k = 1 / n
+    i = 1j
+    zkphi = k * 2 * np.pi * z # [2pi, pi, 1/2pi, 1/4pi]
+    ezkr = np.cos(-zkphi)
+    ezki = np.sin(-zkphi) * i
+    ezk = ezkr + ezki
+    fk = np.dot(data, ezk)
+
+    fk_abs = 2 * np.abs(fk) / n
+    img = np.sum(data, 2) / n
+    mask = ((fk_abs / img) < mp) + (img > th) + (img < tl)
+
+    phi = np.angle(fk)
+    return phi, mask
+
+def unwrape_new1(phi1, phi2, phi3, fs):
+    rows, cols = phi1.shape
+    fh, fm, fl = fs
+    phi12 = np.remainder((phi1 - phi2), 2 * np.pi)
+    phi = phi12
+
+    # phi is so rust need to filter
+    phi = phi.astype(np.float32)
+    phi = cv2.medianBlur(phi, 5)
+    phi = cv2.medianBlur(phi, 5)
+    phi_n = np.round(phi / (2 * np.pi / fl))
+    maskis = (0.5 - np.absolute(phi_n - phi / (2 * np.pi / fl))) < 0.1
+    maskisnot = (0.5 - np.absolute(phi_n - phi / (2 * np.pi / fl))) >= 0.1  # 0.5 is well 0.05 ?
+    phi_new = np.zeros((rows, cols))
+    phi3_new = np.zeros((rows, cols))
+    phi_raw = np.zeros((rows, cols))
+    np.copyto(phi3_new, phi3, where=maskisnot)
+    np.copyto(phi_new, phi_n, where=maskisnot)
+    np.copyto(phi_raw, phi, where=maskis)
+    phi_f = phi_raw + (2 * np.pi * phi_new + phi3_new) / fl
+
+    # filter a gain
+    phi_f = phi_f.astype(np.float32)
+    phi_f = cv2.medianBlur(phi_f, 5)
+    phi_n = np.round(phi_f / (2 * np.pi / fm))
+    maskis = (0.5 - np.absolute(phi_n - phi_f / (2 * np.pi / fm))) < 0.05
+    maskisnot = (0.5 - np.absolute(phi_n - phi_f / (2 * np.pi / fm))) >= 0.05
+    phi_new = np.zeros((rows, cols))
+    phi1_new = np.zeros((rows, cols))
+    phi_raw = np.zeros((rows, cols))
+    np.copyto(phi1_new, phi2, where=maskisnot)
+    np.copyto(phi_new, phi_n, where=maskisnot)
+    np.copyto(phi_raw, phi_f, where=maskis)
+    phi_f = phi_raw + (2 * np.pi * phi_new + phi1_new) / fm
+    phi_f = phi_f.astype(np.float32)
+    phi_f = cv2.medianBlur(phi_f, 5)
+    phi_n = np.round(phi_f / (2 * np.pi / fh))
+    maskis = (0.5 - np.absolute(phi_n - phi_f / (2 * np.pi / fh))) < 0.05
+    maskisnot = (0.5 - np.absolute(phi_n - phi_f / (2 * np.pi / fh))) >= 0.05
+    phi_new = np.zeros((rows, cols))
+    phi1_new = np.zeros((rows, cols))
+    phi_raw = np.zeros((rows, cols))
+    np.copyto(phi1_new, phi1, where=maskisnot)
+    np.copyto(phi_new, phi_n, where=maskisnot)
+    np.copyto(phi_raw, phi_f, where=maskis)
+    phi_f = phi_raw + (2 * np.pi * phi_new + phi1_new) / fh
+    return phi_f, maskis
+
+def reconstruction3D(phasemap, c, r):
+    rows, cols = phasemap.shape
+    phasemap = 1824 * (phasemap / (2 * np.pi))
+    uv = (np.mgrid[0:cols, 0:rows]).T.reshape(-1, 2)  # pointsx1
+    up = phasemap.reshape(-1, 1)  # pointsx1
+    projarray = np.zeros((rows * cols, 3, 3))  # pointsx3x3
+    constantarray = np.zeros((rows * cols, 3))  # pointsx3
+    dephtarray = np.zeros((rows * cols, 3))
+    cim = c[0]
+    pim = c[1]
+    rtc = r[0]
+    rtp = r[1]
+    hc = np.dot(cim, rtc)  # 2x4  camera homomorphic matrix
+    hp = np.dot(pim, rtp)  # 3x4  projector homomorphic matrix
+    projarray[:, 0:2, :] = hc[0:2, 0:3]
+    projarray[:, 2, :] = (-up * hp[2, 0:3]) + hp[0, 0:3]
+    constantarray[:, 0:2] = uv[:, ] - hc[0:2, 3]
+    constantarray[:, 2] = -hp[0, 3] + hp[2, 3] * up[:, 0]
+    for i in range(rows * cols):
+        dephtarray[i] = np.dot(np.linalg.inv(projarray[i]), constantarray[i])
+    depthmap = dephtarray.reshape((rows, cols, 3))
+    return depthmap
+```
