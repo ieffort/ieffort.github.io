@@ -1,4 +1,2 @@
-# About
-
-This is where you put the contents of your *About* page. Like all your pages, it's in [Markdown](https://guides.github.com/features/mastering-markdown/) format.
-
+# 声明
+## 网站仅用于分享，所有资料获得许可
